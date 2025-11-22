@@ -85,3 +85,104 @@ body {
   white-space: nowrap;
   direction: ltr;
 }
+
+/* Glassmorphism Design System */
+.glass-card {
+  background: rgba(26, 26, 26, 0.6);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+}
+
+.glass-card-hover {
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.glass-card-hover:hover {
+  background: rgba(26, 26, 26, 0.8);
+  border-color: rgba(0, 255, 65, 0.3);
+  box-shadow: 0 12px 40px 0 rgba(0, 255, 65, 0.15);
+  transform: translateY(-2px);
+}
+
+.glass-panel {
+  background: rgba(10, 10, 10, 0.7);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Focus Indicators (WCAG AA) */
+.focus-visible:focus-visible {
+  outline: 2px solid #00ff41;
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid #00ff41;
+  outline-offset: 2px;
+}
+
+/* Animation Utilities */
+@keyframes pulse-glow {
+
+  0%,
+  100% {
+    box-shadow: 0 0 10px rgba(0, 255, 65, 0.3);
+  }
+
+  50% {
+    box-shadow: 0 0 20px rgba(0, 255, 65, 0.6);
+  }
+}
+
+.pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -1000px 0;
+  }
+
+  100% {
+    background-position: 1000px 0;
+  }
+}
+
+.skeleton-shimmer {
+  background: linear-gradient(90deg,
+      rgba(26, 26, 26, 0.4) 0%,
+      rgba(255, 255, 255, 0.1) 50%,
+      rgba(26, 26, 26, 0.4) 100%);
+  background-size: 1000px 100%;
+  animation: shimmer 2s infinite;
+}
+
+/* Smooth Transitions */
+.transition-smooth {
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.transition-bounce {
+  transition: all 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+}
+
+/* Gradient Borders */
+.gradient-border {
+  position: relative;
+  background: linear-gradient(#0a0a0a, #0a0a0a) padding-box,
+    linear-gradient(135deg, #00ff41, #00ffff) border-box;
+  border: 2px solid transparent;
+}
+
+.gradient-border-alert {
+  position: relative;
+  background: linear-gradient(#0a0a0a, #0a0a0a) padding-box,
+    linear-gradient(135deg, #ff0040, #ff6b00) border-box;
+  border: 2px solid transparent;
+}
