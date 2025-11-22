@@ -1,0 +1,76 @@
+// This is your Prisma schema file
+// Learn more: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  sessions      Session[]
+  conversations Conversation[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  startedAt DateTime @default(now())
+  endedAt   DateTime?
+  duration  Int?     // in seconds
+  
+  scenario  String
+  metrics   Json     // Store NegotiationEntropyMetric[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([userId])
+}
+
+model Conversation {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  sessionId String?
+  
+  messages  Json     // Store DialogueTransmissionVector[]
+  analysis  Json?    // Store StrategicAnalysisReport
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([userId])
+  @@index([sessionId])
+}
+
+model ApiUsage {
+  id        String   @id @default(cuid())
+  userId    String?
+  
+  endpoint  String
+  method    String
+  status    Int
+  duration  Int      // in milliseconds
+  
+  ipAddress String?
+  userAgent String?
+  
+  createdAt DateTime @default(now())
+  
+  @@index([userId])
+  @@index([endpoint])
+  @@index([createdAt])
+}
