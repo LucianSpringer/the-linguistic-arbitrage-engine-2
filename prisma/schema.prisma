@@ -1,76 +1,67 @@
-// This is your Prisma schema file
-// Learn more: https://pris.ly/d/prisma-schema
+// Prisma Schema for Linguistic Arbitrage Engine
+// Optimized for SQLite (local dev) with Postgres migration path
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
   url      = env("DATABASE_URL")
 }
 
-model User {
-  id            String   @id @default(cuid())
-  email         String   @unique
-  name          String?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-  
-  sessions      Session[]
-  conversations Conversation[]
-}
-
+// Training Session
 model Session {
   id        String   @id @default(cuid())
-  userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
-  startedAt DateTime @default(now())
-  endedAt   DateTime?
-  duration  Int?     // in seconds
-  
-  scenario  String
-  metrics   Json     // Store NegotiationEntropyMetric[]
-  
+  userId    String?  // Optional for anonymous sessions
   createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  duration  Int?     // Duration in seconds
+  
+  scenarioId String?
+  
+  // Relations
+  turns     NegotiationTurn[]
+  metrics   Metric[]
   
   @@index([userId])
-}
-
-model Conversation {
-  id        String   @id @default(cuid())
-  userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
-  sessionId String?
-  
-  messages  Json     // Store DialogueTransmissionVector[]
-  analysis  Json?    // Store StrategicAnalysisReport
-  
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  
-  @@index([userId])
-  @@index([sessionId])
-}
-
-model ApiUsage {
-  id        String   @id @default(cuid())
-  userId    String?
-  
-  endpoint  String
-  method    String
-  status    Int
-  duration  Int      // in milliseconds
-  
-  ipAddress String?
-  userAgent String?
-  
-  createdAt DateTime @default(now())
-  
-  @@index([userId])
-  @@index([endpoint])
   @@index([createdAt])
+}
+
+// Individual negotiation exchange
+model NegotiationTurn {
+  id         String   @id @default(cuid())
+  sessionId  String
+  session    Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  
+  prompt     String   // User input
+  response   String   // AI response
+  latencyMs  Int      // Response time in milliseconds
+  
+  cacheHit   Boolean  @default(false)
+  timestamp  DateTime @default(now())
+  
+  @@index([sessionId])
+  @@index([timestamp])
+}
+
+// Performance metrics per turn
+model Metric {
+  id        String   @id @default(cuid())
+  sessionId String
+  session   Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  
+  // Core metrics
+  verbalVelocity    Float    // Words per minute
+  sentimentScore    Float    // -1.0 to 1.0
+  confidenceScore   Float    // 0.0 to 1.0
+  
+  // Extended metrics
+  levenshteinDelta  Int?
+  hesitationMarkers Int?
+  spectralIntensity Float?
+  
+  timestamp DateTime @default(now())
+  
+  @@index([sessionId])
+  @@index([timestamp])
 }

@@ -1,10 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { GoogleGenAI, GenerateContentResponse } from '@google/genai';
-import { rateLimit, getRateLimitHeaders } from '../../../lib/rateLimiter';
-import logger from '../../../lib/logger';
+import { GoogleGenAI } from '@google/genai';
+import { RateLimiterMemory } from 'rate-limiter-flexible';
+import { PrismaClient } from '@prisma/client';
+import { CachedNegotiationService } from '../../../services/cacheService';
+
+const prisma = new PrismaClient();
+
+// Rate limiter: 10 requests per minute per IP
+const rateLimiter = new RateLimiterMemory({
+    points: 10,
+    duration: 60,
+});
 
 interface NegotiateRequest {
     prompt: string;
+    scenarioId?: string;
+    sessionId?: string;
     history: Array<{
         id: string;
         origin: 'OPERATOR' | 'SYNTHETIC_AGENT';
@@ -13,132 +24,210 @@ interface NegotiateRequest {
     }>;
 }
 
+/**
+ * Helper: Get client IP address
+ */
+function getClientIP(request: NextRequest): string {
+    return (
+        request.headers.get('x-forwarded-for')?.split(',')[0] ||
+        request.headers.get('x-real-ip') ||
+        'unknown'
+    );
+}
+
+/**
+ * Helper: Save turn to database (fire-and-forget)
+ */
+async function saveTurnAsync(
+    sessionId: string | undefined,
+    prompt: string,
+    response: string,
+    latencyMs: number,
+    cacheHit: boolean
+): Promise<void> {
+    try {
+        // Create session if doesn't exist
+        let finalSessionId = sessionId;
+        if (!finalSessionId) {
+            const session = await prisma.session.create({
+                data: { userId: null },
+            });
+            finalSessionId = session.id;
+        }
+
+        // Save turn
+        await prisma.negotiationTurn.create({
+            data: {
+                sessionId: finalSessionId,
+                prompt,
+                response,
+                latencyMs,
+                cacheHit,
+            },
+        });
+
+        console.log(`[DB_SAVE] Turn saved to session: ${finalSessionId}`);
+    } catch (error) {
+        console.error('[DB_ERROR] Failed to save turn:', error);
+        // Don't throw - persistence is optional
+    }
+}
+
 export async function POST(request: NextRequest) {
     const startTime = Date.now();
-    const ipAddress = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown';
+    const clientIP = getClientIP(request);
 
     try {
-        // Rate limiting
-        const rateLimitResult = await rateLimit(ipAddress);
-        const rateLimitHeaders = getRateLimitHeaders(rateLimitResult);
-
-        if (!rateLimitResult.success) {
-            logger.warn('Rate limit exceeded', { ipAddress, endpoint: '/api/negotiate' });
+        // 1. RATE LIMITING
+        try {
+            await rateLimiter.consume(clientIP);
+        } catch (rateLimiterRes: any) {
+            console.log(`[RATE_LIMIT] IP blocked: ${clientIP}`);
             return NextResponse.json(
                 { error: 'Too many requests. Please try again later.' },
                 {
                     status: 429,
-                    headers: rateLimitHeaders
+                    headers: {
+                        'Retry-After': String(Math.ceil(rateLimiterRes.msBeforeNext / 1000)),
+                    },
                 }
             );
         }
 
-        // Validate API key exists
+        // 2. VALIDATE API KEY
         const apiKey = process.env.GEMINI_API_KEY;
         if (!apiKey) {
-            logger.error('GEMINI_API_KEY not configured');
+            console.error('[API_ERROR] GEMINI_API_KEY not configured');
             return NextResponse.json(
                 { error: 'API service not configured' },
                 { status: 500 }
             );
         }
 
-        // Parse request body
+        // 3. PARSE REQUEST
         const body: NegotiateRequest = await request.json();
-        const { prompt, history } = body;
+        const { prompt, scenarioId = 'default', sessionId, history } = body;
 
         if (!prompt) {
             return NextResponse.json(
                 { error: 'Prompt is required' },
-                { status: 400, headers: rateLimitHeaders }
+                { status: 400 }
             );
         }
 
-        logger.info('Negotiate request received', {
-            promptLength: prompt.length,
-            historyLength: history?.length || 0,
-            ipAddress
-        });
+        console.log(`[API_INVOKE] IP=${clientIP} Scenario=${scenarioId} Prompt="${prompt.substring(0, 50)}..."`);
 
-        // Initialize Gemini AI
-        const ai = new GoogleGenAI({ apiKey });
-
-        // Construct context from history
-        const context = history?.map(h => `${h.origin}: ${h.payload}`).join('\n') || '';
-        const fullPrompt = `
-      CONTEXT_HISTORY:
-      ${context}
-
-      CURRENT_INPUT:
-      ${prompt}
-
-      MISSION:
-      Analyze the negotiation leverage. Provide a strategic counter-move.
-    `;
-
-        // Execute Deep Think with retry logic
-        let attempts = 0;
-        const MAX_RETRIES = 3;
-
-        while (attempts < MAX_RETRIES) {
-            try {
-                const response: GenerateContentResponse = await ai.models.generateContent({
-                    model: 'gemini-2.0-flash-thinking-exp-1219',
-                    contents: fullPrompt,
-                    config: {
-                        thinkingConfig: { thinkingBudget: 32768 },
-                    }
-                });
-
-                const responseText = response.text || 'NO_RESPONSE';
-                const duration = Date.now() - startTime;
-
-                logger.info('Negotiate request successful', {
-                    duration,
-                    responseLength: responseText.length,
-                    attempts: attempts + 1
-                });
-
-                return NextResponse.json({
-                    response: responseText,
-                    success: true
-                }, {
-                    headers: rateLimitHeaders
-                });
-
-            } catch (error: any) {
-                attempts++;
-                logger.error('Gemini API error', {
-                    attempt: attempts,
-                    error: error.message,
-                    ipAddress
-                });
-
-                if (attempts >= MAX_RETRIES) {
-                    return NextResponse.json(
-                        { error: 'AI service temporarily unavailable', details: error.message },
-                        { status: 503, headers: rateLimitHeaders }
-                    );
-                }
-
-                // Exponential backoff
-                await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempts) * 1000));
-            }
-        }
-
-        return NextResponse.json(
-            { error: 'Maximum retries exceeded' },
-            { status: 503, headers: rateLimitHeaders }
+        // 4. CHECK CACHE
+        const cachedResponse = await CachedNegotiationService.getCachedResponse(
+            prompt,
+            scenarioId
         );
 
-    } catch (error: any) {
-        const duration = Date.now() - startTime;
-        logger.error('API error', {
-            error: error.message,
-            stack: error.stack,
-            duration,
-            ipAddress
+        if (cachedResponse) {
+            const latency = Date.now() - startTime;
+            console.log(`[API_INVOKE] IP=${clientIP} Scenario=${scenarioId} Cache=HIT Latency=${latency}ms`);
+
+            // Save to DB asynchronously
+            saveTurnAsync(sessionId, prompt, cachedResponse, latency, true).catch(
+                console.error
+            );
+
+            return NextResponse.json(
+                {
+                    response: cachedResponse,
+                    success: true,
+                    cached: true,
+                },
+                {
+                    headers: {
+                        'X-Cache': 'HIT',
+                    },
+                }
+            );
+        }
+
+        console.log(`[API_INVOKE] IP=${clientIP} Scenario=${scenarioId} Cache=MISS`);
+
+        // 5. INITIALIZE GEMINI AI
+        const ai = new GoogleGenAI({ apiKey });
+
+        // 6. CONSTRUCT PROMPT
+        const context =
+            history?.map((h) => `${h.origin}: ${h.payload}`).join('\n') || '';
+        const fullPrompt = `
+CONTEXT_HISTORY:
+${context}
+
+CURRENT_INPUT:
+${prompt}
+
+MISSION:
+Analyze the negotiation leverage. Provide a strategic counter-move.
+    `.trim();
+
+        // 7. STREAMING RESPONSE
+        const encoder = new TextEncoder();
+        let fullResponse = '';
+
+        const stream = new ReadableStream({
+            async start(controller) {
+                try {
+                    const response = await ai.models.streamGenerateContent({
+                        model: 'gemini-2.0-flash-thinking-exp-1219',
+                        contents: fullPrompt,
+                        config: {
+                            thinkingConfig: { thinkingBudget: 32768 },
+                        },
+                    });
+
+                    // Stream chunks
+                    for await (const chunk of response.stream) {
+                        const text = chunk.text || '';
+                        fullResponse += text;
+                        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text })}\n\n`));
+                    }
+
+                    // Send completion signal
+                    controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                    controller.close();
+
+                    const latency = Date.now() - startTime;
+                    console.log(`[API_INVOKE] IP=${clientIP} Scenario=${scenarioId} Cache=MISS Latency=${latency}ms`);
+
+                    // Cache response asynchronously
+                    CachedNegotiationService.cacheResponse(
+                        prompt,
+                        scenarioId,
+                        fullResponse
+                    ).catch(console.error);
+
+                    // Save to DB asynchronously
+                    saveTurnAsync(sessionId, prompt, fullResponse, latency, false).catch(
+                        console.error
+                    );
+                } catch (error: any) {
+                    console.error('[GEMINI_ERROR]', error);
+                    controller.enqueue(
+                        encoder.encode(
+                            `data: ${JSON.stringify({ error: error.message })}\n\n`
+                        )
+                    );
+                    controller.close();
+                }
+            },
         });
+
+        return new NextResponse(stream, {
+            headers: {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Cache': 'MISS',
+            },
+        });
+    } catch (error: any) {
+        const latency = Date.now() - startTime;
+        console.error(`[API_ERROR] IP=${clientIP} Latency=${latency}ms Error=${error.message}`);
 
         return NextResponse.json(
             { error: 'Internal server error', details: error.message },
