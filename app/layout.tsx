@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import { ErrorBoundary } from '../components/ErrorBoundary';
+import { WebVitalsReporter } from '../components/WebVitalsReporter';
 import './globals.css';
 
 export const metadata: Metadata = {
@@ -21,6 +22,7 @@ export default function RootLayout({
                 />
             </head>
             <body>
+                <WebVitalsReporter />
                 <ErrorBoundary>
                     {children}
                 </ErrorBoundary>
