@@ -3,12 +3,12 @@ import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { CircuitBreakerThresholds } from '../types';
 
 interface VoiceStreamProcessorConfig {
-  apiKey?: string; // Optional - will be removed when Live API gets backend proxy
-  voiceName: string; // Configurable Voice
-  isAcousticCaptureActive: boolean; // Mic Toggle
+  apiKey?: string;
+  voiceName: string;
+  isAcousticCaptureActive: boolean;
   onTranscriptUpdate: (text: string, isFinal: boolean) => void;
-  onAudioData: (audioBuffer: AudioBuffer) => void; // Model Output
-  onSpectralFluxAnalysis: (amplitude: number) => void; // Microphone Input Level
+  onAudioData: (audioBuffer: AudioBuffer) => void;
+  onSpectralFluxAnalysis: (amplitude: number) => void;
 }
 
 export const useVoiceStreamProcessor = ({
@@ -30,25 +30,12 @@ export const useVoiceStreamProcessor = ({
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null); // REPLACED ScriptProcessor
+
   const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
 
   // Audio Processing Helpers
-  const createBlob = (data: Float32Array) => {
-    const l = data.length;
-    const int16 = new Int16Array(l);
-    for (let i = 0; i < l; i++) {
-      int16[i] = data[i] * 32768;
-    }
-    const binaryString = Array.from(new Uint8Array(int16.buffer))
-      .map((byte) => String.fromCharCode(byte))
-      .join("");
-    return {
-      data: btoa(binaryString),
-      mimeType: "audio/pcm;rate=16000",
-    };
-  };
-
   const decodeAudioData = async (base64: string, ctx: AudioContext): Promise<AudioBuffer> => {
     const binaryString = atob(base64);
     const len = binaryString.length;
@@ -68,17 +55,12 @@ export const useVoiceStreamProcessor = ({
     return buffer;
   };
 
-  const calculateRMS = (data: Float32Array): number => {
-    let sum = 0;
-    for (let i = 0; i < data.length; i++) {
-      sum += data[i] * data[i];
-    }
-    return Math.sqrt(sum / data.length);
-  };
-
   const initiateNeuralLink = useCallback(async () => {
-    if (!apiKey) {
-      setConnectionError("CRITICAL: API_KEY_MISSING");
+    // AUTO-DETECT KEY: Use prop OR Environment Variable
+    const effectiveKey = apiKey || process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+
+    if (!effectiveKey) {
+      setConnectionError("CRITICAL: API_KEY_MISSING (Check .env.local with NEXT_PUBLIC_GEMINI_API_KEY)");
       return;
     }
 
@@ -88,13 +70,22 @@ export const useVoiceStreamProcessor = ({
     }
 
     try {
-      const ai = new GoogleGenAI({ apiKey });
+      const ai = new GoogleGenAI({ apiKey: effectiveKey });
 
+      // Initialize Audio Contexts
       if (!inputAudioContextRef.current) {
         inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       }
       if (!outputAudioContextRef.current) {
         outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      }
+
+      // Load AudioWorklet Module
+      try {
+        await inputAudioContextRef.current.audioWorklet.addModule('/audio-processor.worklet.js');
+      } catch (e) {
+        console.error("Failed to load audio worklet:", e);
+        throw new Error("AUDIO_WORKLET_LOAD_FAILED");
       }
 
       if (!streamRef.current) {
@@ -108,18 +99,15 @@ export const useVoiceStreamProcessor = ({
         });
       }
 
-      console.log(`[NEURAL_LINK] Attempting connection (Attempt ${retryAttempt + 1}) | Voice: ${voiceName}`);
+      console.log(`[NEURAL_LINK] Connecting... | Voice: ${voiceName}`);
 
       const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+        model: 'gemini-2.0-flash-exp',
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } },
           },
-          systemInstruction: "You are a ruthless corporate negotiator simulating a hostile takeover scenario. Be brief, demanding, and analyze the user's confidence.",
-          inputAudioTranscription: {},
-          outputAudioTranscription: {}
         },
         callbacks: {
           onopen: () => {
@@ -129,27 +117,31 @@ export const useVoiceStreamProcessor = ({
             setRetryAttempt(0);
 
             if (!inputAudioContextRef.current || !streamRef.current) return;
+
             const source = inputAudioContextRef.current.createMediaStreamSource(streamRef.current);
-            const scriptProcessor = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
+            const workletNode = new AudioWorkletNode(inputAudioContextRef.current, 'audio-processor');
 
-            scriptProcessor.onaudioprocess = (e) => {
-              const inputData = e.inputBuffer.getChannelData(0);
+            workletNode.port.onmessage = (event) => {
+              const { type, value, data } = event.data;
 
-              // Calculate Input Amplitude (Spectral Flux)
-              const rms = calculateRMS(inputData);
-              onSpectralFluxAnalysis(rms);
+              if (type === 'rms') {
+                onSpectralFluxAnalysis(value);
+              }
 
-              // Gating Logic: Only send if Mic is Active
-              if (isAcousticCaptureActive) {
-                const pcmBlob = createBlob(inputData);
+              if (type === 'audio' && isAcousticCaptureActive) {
+                // 'data' is base64 from the worklet
                 sessionPromise.then(session => {
-                  session.sendRealtimeInput({ media: pcmBlob });
+                  session.sendRealtimeInput({
+                    mimeType: "audio/pcm;rate=16000",
+                    data: data
+                  });
                 });
               }
             };
 
-            source.connect(scriptProcessor);
-            scriptProcessor.connect(inputAudioContextRef.current.destination);
+            source.connect(workletNode);
+            workletNode.connect(inputAudioContextRef.current.destination);
+            workletNodeRef.current = workletNode;
           },
           onmessage: async (msg: LiveServerMessage) => {
             if (msg.serverContent?.inputTranscription?.text) {
@@ -160,18 +152,19 @@ export const useVoiceStreamProcessor = ({
             if (audioData && outputAudioContextRef.current) {
               const buffer = await decodeAudioData(audioData, outputAudioContextRef.current);
 
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outputAudioContextRef.current.currentTime);
+              // SYNC FIX: Ensure absolute time scheduling
+              const currentTime = outputAudioContextRef.current.currentTime;
+              if (nextStartTimeRef.current < currentTime) {
+                nextStartTimeRef.current = currentTime;
+              }
 
               const source = outputAudioContextRef.current.createBufferSource();
               source.buffer = buffer;
               source.connect(outputAudioContextRef.current.destination);
 
-              source.addEventListener('ended', () => {
-                sourcesRef.current.delete(source);
-              });
-
               source.start(nextStartTimeRef.current);
               nextStartTimeRef.current += buffer.duration;
+
               sourcesRef.current.add(source);
 
               onAudioData(buffer);
@@ -184,24 +177,7 @@ export const useVoiceStreamProcessor = ({
           onerror: (e: any) => {
             console.error("[NEURAL_LINK] Error:", e);
             setIsConnectionActive(false);
-
-            // Enhanced Error Reporting
-            const errorMsg = e.message || e.toString();
-            const errorCode = errorMsg.includes("40") ? "AUTH_FAILURE" : errorMsg.includes("50") ? "SERVER_OVERLOAD" : "PROTOCOL_ERROR";
-            const detailedError = `[${errorCode}] ${errorMsg}`;
-
-            if (retryAttempt < CircuitBreakerThresholds.MAX_RETRY_ATTEMPTS) {
-              const backoffDelay = Math.pow(2, retryAttempt) * 1000;
-              console.warn(`[CIRCUIT_BREAKER] Connection destabilized. Retrying in ${backoffDelay}ms...`);
-              setConnectionError(`${detailedError} :: RETRYING_IN_${backoffDelay}ms`);
-
-              retryTimeoutRef.current = setTimeout(() => {
-                setRetryAttempt(prev => prev + 1);
-                initiateNeuralLink();
-              }, backoffDelay);
-            } else {
-              setConnectionError(`CIRCUIT_BREAKER_OPEN :: ${detailedError}`);
-            }
+            setConnectionError(`CONNECTION_ERROR: ${e.message}`);
           }
         }
       });
@@ -212,18 +188,16 @@ export const useVoiceStreamProcessor = ({
       setConnectionError(`INITIALIZATION_FAILURE :: ${err.message}`);
       setIsConnectionActive(false);
     }
-  }, [apiKey, voiceName, isAcousticCaptureActive, onTranscriptUpdate, onAudioData, onSpectralFluxAnalysis, retryAttempt]);
+  }, [apiKey, voiceName, isAcousticCaptureActive, onTranscriptUpdate, onAudioData, onSpectralFluxAnalysis]);
 
   const severNeuralLink = useCallback(() => {
-    if (retryTimeoutRef.current) {
-      clearTimeout(retryTimeoutRef.current);
-      retryTimeoutRef.current = null;
-    }
-    setRetryAttempt(0);
-
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
+    }
+    if (workletNodeRef.current) {
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
     }
     if (inputAudioContextRef.current) {
       inputAudioContextRef.current.close();
@@ -233,8 +207,18 @@ export const useVoiceStreamProcessor = ({
       outputAudioContextRef.current.close();
       outputAudioContextRef.current = null;
     }
+    // Clean up audio sources
+    sourcesRef.current.forEach(source => {
+      try {
+        source.stop();
+        source.disconnect();
+      } catch (e) {
+        // Already stopped
+      }
+    });
+    sourcesRef.current.clear();
+
     setIsConnectionActive(false);
-    setConnectionError(null);
   }, []);
 
   return {
